@@ -1,0 +1,6 @@
+.idea
+.git
+
+build/*
+7d2d_*
+*.user
