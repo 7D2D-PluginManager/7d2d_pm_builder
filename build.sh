@@ -125,6 +125,9 @@ generate_package_reference_targets() {
             printf '    </Reference>\n'
         fi
         for shared_name in PluginManager.Api PluginManager.Config PluginManager.Localization; do
+            if ! grep -Fq "$shared_name.dll" "$project"; then
+                continue
+            fi
             for shared_dir in "$MOD_DIR" "$REFS_DIR"; do
                 local shared_dll="$shared_dir/$shared_name.dll"
                 if [[ -f "$shared_dll" ]]; then
@@ -167,6 +170,46 @@ generate_package_reference_targets() {
     } > "$target_file"
 }
 
+copy_runtime_assets() {
+    local project="$1"
+    local output_path="$2"
+    local project_dir
+    project_dir="$(dirname "$project")"
+    local assets_file="$project_dir/obj/project.assets.json"
+
+    if [[ ! -f "$assets_file" ]] || ! command -v jq >/dev/null 2>&1; then
+        return
+    fi
+
+    jq -r '
+        . as $assets
+        | ($assets.packageFolders | keys[0]) as $packageRoot
+        | $assets.targets[]
+        | to_entries[]
+        | select(.value.runtime != null)
+        | .key as $packageKey
+        | ($assets.libraries[$packageKey].path) as $packagePath
+        | .value.runtime
+        | keys[]
+        | select(test("\\.dll$"))
+        | select(startswith("ref/") | not)
+        | "\($packageRoot)\($packagePath)/\(.)"
+    ' "$assets_file" | sort -u | while IFS= read -r dll_path; do
+        [[ -f "$dll_path" ]] || continue
+        local dll_name
+        dll_name="$(basename "$dll_path")"
+        if [[ "$output_path" == "$MOD_DIR" && "$dll_name" == System*.dll && -f "$MANAGED_DIR/$dll_name" ]]; then
+            continue
+        fi
+        cp -f "$dll_path" "$output_path/$dll_name"
+
+        local xml_path="${dll_path%.dll}.xml"
+        if [[ -f "$xml_path" ]]; then
+            cp -f "$xml_path" "$output_path/$(basename "$xml_path")"
+        fi
+    done
+}
+
 msbuild_project() {
     local project="$1"
     local output_path="$2"
@@ -200,16 +243,27 @@ msbuild_project() {
     done
 
     dotnet "${args[@]}"
+    copy_runtime_assets "$project" "$output_path"
 }
 
-copy_shared_library() {
-    local name="$1"
-    if [[ -f "$REFS_DIR/$name.dll" ]]; then
-        cp -f "$REFS_DIR/$name.dll" "$MOD_DIR/$name.dll"
-    fi
-    if [[ -f "$REFS_DIR/$name.pdb" ]]; then
-        cp -f "$REFS_DIR/$name.pdb" "$MOD_DIR/$name.pdb"
-    fi
+copy_staged_libraries() {
+    find "$REFS_DIR" -maxdepth 1 -type f \( -name '*.dll' -o -name '*.pdb' -o -name '*.xml' \) \
+        ! -name 'System*.dll' \
+        ! -name 'System*.xml' \
+        -exec cp -f {} "$MOD_DIR/" \;
+}
+
+remove_system_libraries_from_mod_root() {
+    find "$MOD_DIR" -maxdepth 1 -type f \( -name 'System*.dll' -o -name 'System*.xml' \) -print0 \
+        | while IFS= read -r -d '' file; do
+            local base
+            base="$(basename "$file")"
+            base="${base%.xml}"
+            base="${base%.dll}"
+            if [[ -f "$MANAGED_DIR/$base.dll" ]]; then
+                rm -f "$file"
+            fi
+        done
 }
 
 echo "==> Building shared PluginManager libraries"
@@ -225,9 +279,8 @@ msbuild_project "$ROOT_DIR/7d2d_plugin_manager_core/src/PluginManager.Core/Plugi
     "HarmonyPath=$HARMONY_DIR/" \
     "StaticPath=$ROOT_DIR/7d2d_plugin_manager_core/static/"
 
-copy_shared_library PluginManager.Api
-copy_shared_library PluginManager.Config
-copy_shared_library PluginManager.Localization
+copy_staged_libraries
+remove_system_libraries_from_mod_root
 
 plugin_projects=(
     "HomePlugin|$ROOT_DIR/7d2d_pm_home/src/HomePlugin/HomePlugin.csproj|$ROOT_DIR/7d2d_pm_home/static"
@@ -235,6 +288,8 @@ plugin_projects=(
     "TileClaimProtector|$ROOT_DIR/7d2d_pm_tile_clime_protector/src/TileClaimProtector/TileClaimProtector.csproj|"
     "TpaPlugin|$ROOT_DIR/7d2d_pm_tpa/src/TpaPlugin/TpaPlugin.csproj|$ROOT_DIR/7d2d_pm_tpa/static"
     "WelcomeMessage|$ROOT_DIR/7d2d_pm_welcome_mesage/src/WelcomeMessage/WelcomeMessage.csproj|"
+    "GiveItemPlugin|$ROOT_DIR/7d2d_pm_give_item/src/GiveItemPlugin/GiveItemPlugin.csproj|$ROOT_DIR/7d2d_pm_give_item/static"
+    "BloodMoonPlugin|$ROOT_DIR/7d2d_pm_blood_moon/src/BloodMoonPlugin/BloodMoonPlugin.csproj|$ROOT_DIR/7d2d_pm_blood_moon/static"
 )
 
 loaded_plugins=()
@@ -244,7 +299,7 @@ for entry in "${plugin_projects[@]}"; do
     IFS='|' read -r plugin_name project_path static_path <<< "$entry"
     plugin_output="$PLUGINS_DIR/$plugin_name"
 
-    properties=("PluginManagerApiPath=$MOD_DIR/")
+    properties=("PluginManagerApiPath=$MOD_DIR/" "GameLibsPath=$MANAGED_DIR/")
     if [[ -n "$static_path" ]]; then
         properties+=("StaticPath=$static_path/")
     fi
