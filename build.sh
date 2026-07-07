@@ -6,15 +6,21 @@ CONFIGURATION="Release"
 SERVER_ROOT="${SDTD_SERVER_ROOT:-/home/sdtdtest/serverfiles}"
 OUT_DIR="$ROOT_DIR/build"
 CLEAN=1
+FORCE_CORE=0
 
 usage() {
     cat <<USAGE
 Usage: ./build.sh [options]
 
+Plugins are discovered automatically (<dir>/src/<Name>/<Name>.csproj).
+An interactive menu lets you pick plugins to rebuild, press Enter for a
+full rebuild, or enter 0 to exit. Without a terminal a full build runs.
+
 Options:
   -c, --configuration <Debug|Release>   Build configuration. Default: Release.
   -s, --server-root <path>              7 Days to Die server root. Default: \$SDTD_SERVER_ROOT or /home/sdtdtest/serverfiles.
   -o, --out <path>                      Output directory. Default: ./build.
+      --core                            Force rebuild of shared libraries and core on partial builds.
       --no-clean                        Keep the existing output directory.
   -h, --help                            Show this help.
 
@@ -36,6 +42,10 @@ while [[ $# -gt 0 ]]; do
         -o|--out)
             OUT_DIR="${2:?Missing value for $1}"
             shift 2
+            ;;
+        --core)
+            FORCE_CORE=1
+            shift
             ;;
         --no-clean)
             CLEAN=0
@@ -85,12 +95,6 @@ if [[ -n "$FRAMEWORK_PATH_OVERRIDE" && ! -d "$FRAMEWORK_PATH_OVERRIDE" ]]; then
     echo "FRAMEWORK_PATH_OVERRIDE points to a missing directory: $FRAMEWORK_PATH_OVERRIDE" >&2
     exit 1
 fi
-
-if [[ "$CLEAN" -eq 1 ]]; then
-    rm -rf "$OUT_DIR"
-fi
-
-mkdir -p "$REFS_DIR" "$MOD_DIR" "$PLUGINS_DIR"
 
 restore_project() {
     local project="$1"
@@ -266,50 +270,160 @@ remove_system_libraries_from_mod_root() {
         done
 }
 
-echo "==> Building shared PluginManager libraries"
-msbuild_project "$ROOT_DIR/7d2d_plugin_manager_api/src/PluginManager.Api/PluginManager.Api.csproj" "$REFS_DIR"
-msbuild_project "$ROOT_DIR/7d2d_plugin_manager_config/src/PluginManager.Config/PluginManager.Config.csproj" "$REFS_DIR"
-msbuild_project "$ROOT_DIR/7d2d_plugin_manager_localization/src/PluginManager.Localization/PluginManager.Localization.csproj" "$REFS_DIR" \
-    "PluginManagerApiPath=$REFS_DIR/"
+discover_plugins() {
+    PLUGIN_NAMES=()
+    PLUGIN_PROJECTS=()
+    PLUGIN_STATICS=()
+    PLUGIN_MODULES=()
 
-echo "==> Building PluginManager core mod"
-msbuild_project "$ROOT_DIR/7d2d_plugin_manager_core/src/PluginManager.Core/PluginManager.Core.csproj" "$MOD_DIR" \
-    "PluginManagerApiPath=$REFS_DIR/" \
-    "GameLibsPath=$MANAGED_DIR/" \
-    "HarmonyPath=$HARMONY_DIR/" \
-    "StaticPath=$ROOT_DIR/7d2d_plugin_manager_core/static/"
+    local name csproj static_path module_name
+    while IFS='|' read -r name csproj static_path module_name; do
+        PLUGIN_NAMES+=("$name")
+        PLUGIN_PROJECTS+=("$csproj")
+        PLUGIN_STATICS+=("$static_path")
+        PLUGIN_MODULES+=("$module_name")
+    done < <(
+        find "$ROOT_DIR" -mindepth 4 -maxdepth 4 -path "$ROOT_DIR/*/src/*/*.csproj" \
+            ! -path "$ROOT_DIR/build/*" ! -path "$OUT_DIR/*" ! -name 'PluginManager.*.csproj' \
+        | while IFS= read -r csproj; do
+            name="$(basename "$csproj" .csproj)"
+            local plugin_root
+            plugin_root="$(dirname "$(dirname "$(dirname "$csproj")")")"
+            static_path=""
+            if [[ -d "$plugin_root/static" ]]; then
+                static_path="$plugin_root/static"
+            fi
+            module_name="$(grep -rhoP 'ModuleName\s*=>\s*"\K[^"]+' "$plugin_root/src" 2>/dev/null | head -n 1 || true)"
+            printf '%s|%s|%s|%s\n' "$name" "$csproj" "$static_path" "${module_name:-$name}"
+        done | sort -t'|' -k1,1
+    )
+}
 
-copy_staged_libraries
-remove_system_libraries_from_mod_root
+select_plugins() {
+    echo "Discovered plugins:"
+    local i
+    for i in "${!PLUGIN_MODULES[@]}"; do
+        printf '  %2d) %s\n' "$((i + 1))" "${PLUGIN_MODULES[$i]}"
+    done
+    echo
 
-plugin_projects=(
-    "HomePlugin|$ROOT_DIR/7d2d_pm_home/src/HomePlugin/HomePlugin.csproj|$ROOT_DIR/7d2d_pm_home/static"
-    "PlayerChatDecor|$ROOT_DIR/7d2d_pm_player_chat_decor/src/PlayerChatDecor/PlayerChatDecor.csproj|$ROOT_DIR/7d2d_pm_player_chat_decor/static"
-    "TileClaimProtector|$ROOT_DIR/7d2d_pm_tile_clime_protector/src/TileClaimProtector/TileClaimProtector.csproj|"
-    "TpaPlugin|$ROOT_DIR/7d2d_pm_tpa/src/TpaPlugin/TpaPlugin.csproj|$ROOT_DIR/7d2d_pm_tpa/static"
-    "WelcomeMessage|$ROOT_DIR/7d2d_pm_welcome_mesage/src/WelcomeMessage/WelcomeMessage.csproj|"
-    "GiveItemPlugin|$ROOT_DIR/7d2d_pm_give_item/src/GiveItemPlugin/GiveItemPlugin.csproj|$ROOT_DIR/7d2d_pm_give_item/static"
-    "BloodMoonPlugin|$ROOT_DIR/7d2d_pm_blood_moon/src/BloodMoonPlugin/BloodMoonPlugin.csproj|$ROOT_DIR/7d2d_pm_blood_moon/static"
-)
+    local input token valid indices
+    while true; do
+        read -r -p "Select (numbers separated by spaces, Enter = full rebuild, 0 = exit): " input
+        input="${input//,/ }"
 
-loaded_plugins=()
+        if [[ -z "${input// /}" ]]; then
+            return 0
+        fi
 
-echo "==> Building plugins"
-for entry in "${plugin_projects[@]}"; do
-    IFS='|' read -r plugin_name project_path static_path <<< "$entry"
-    plugin_output="$PLUGINS_DIR/$plugin_name"
+        valid=1
+        indices=()
+        for token in $input; do
+            if [[ "$token" == "0" ]]; then
+                echo "Exit."
+                exit 0
+            fi
+            if ! [[ "$token" =~ ^[0-9]+$ ]] || (( token < 1 || token > ${#PLUGIN_NAMES[@]} )); then
+                echo "Invalid selection: $token" >&2
+                valid=0
+                break
+            fi
+            indices+=("$((token - 1))")
+        done
 
-    properties=("PluginManagerApiPath=$MOD_DIR/" "GameLibsPath=$MANAGED_DIR/")
+        if [[ "$valid" -eq 1 ]]; then
+            mapfile -t SELECTED_INDICES < <(printf '%s\n' "${indices[@]}" | sort -nu)
+            return 0
+        fi
+    done
+}
+
+build_core() {
+    echo "==> Building shared PluginManager libraries"
+    msbuild_project "$ROOT_DIR/7d2d_plugin_manager_api/src/PluginManager.Api/PluginManager.Api.csproj" "$REFS_DIR"
+    msbuild_project "$ROOT_DIR/7d2d_plugin_manager_config/src/PluginManager.Config/PluginManager.Config.csproj" "$REFS_DIR"
+    msbuild_project "$ROOT_DIR/7d2d_plugin_manager_localization/src/PluginManager.Localization/PluginManager.Localization.csproj" "$REFS_DIR" \
+        "PluginManagerApiPath=$REFS_DIR/"
+
+    echo "==> Building PluginManager core mod"
+    msbuild_project "$ROOT_DIR/7d2d_plugin_manager_core/src/PluginManager.Core/PluginManager.Core.csproj" "$MOD_DIR" \
+        "PluginManagerApiPath=$REFS_DIR/" \
+        "GameLibsPath=$MANAGED_DIR/" \
+        "HarmonyPath=$HARMONY_DIR/" \
+        "StaticPath=$ROOT_DIR/7d2d_plugin_manager_core/static/"
+
+    copy_staged_libraries
+    remove_system_libraries_from_mod_root
+}
+
+build_plugin() {
+    local index="$1"
+    local plugin_name="${PLUGIN_NAMES[$index]}"
+    local project_path="${PLUGIN_PROJECTS[$index]}"
+    local static_path="${PLUGIN_STATICS[$index]}"
+    local plugin_output="$PLUGINS_DIR/$plugin_name"
+
+    echo "==> Building plugin: ${PLUGIN_MODULES[$index]}"
+    rm -rf "$plugin_output"
+
+    local properties=("PluginManagerApiPath=$MOD_DIR/" "GameLibsPath=$MANAGED_DIR/")
     if [[ -n "$static_path" ]]; then
         properties+=("StaticPath=$static_path/")
     fi
 
     msbuild_project "$project_path" "$plugin_output" "${properties[@]}"
-    loaded_plugins+=("$plugin_name")
-done
+
+    if [[ -n "$static_path" ]]; then
+        local plugin_root
+        plugin_root="$(dirname "$static_path")"
+        if [[ -d "$plugin_root/lang" && ! -d "$static_path/lang" ]]; then
+            cp -r "$plugin_root/lang" "$plugin_output/"
+        fi
+    fi
+}
+
+discover_plugins
+
+if [[ "${#PLUGIN_NAMES[@]}" -eq 0 ]]; then
+    echo "No plugin projects found under $ROOT_DIR (<dir>/src/<Name>/<Name>.csproj)." >&2
+    exit 1
+fi
+
+SELECTED_INDICES=()
+if [[ -t 0 ]]; then
+    select_plugins
+fi
+
+if [[ "${#SELECTED_INDICES[@]}" -eq 0 ]]; then
+    if [[ "$CLEAN" -eq 1 ]]; then
+        rm -rf "$OUT_DIR"
+    fi
+    mkdir -p "$REFS_DIR" "$MOD_DIR" "$PLUGINS_DIR"
+
+    build_core
+
+    for i in "${!PLUGIN_NAMES[@]}"; do
+        build_plugin "$i"
+    done
+else
+    mkdir -p "$REFS_DIR" "$MOD_DIR" "$PLUGINS_DIR"
+
+    if [[ "$FORCE_CORE" -eq 1 || ! -f "$MOD_DIR/PluginManager.Core.dll" ]]; then
+        build_core
+    fi
+
+    for i in "${SELECTED_INDICES[@]}"; do
+        build_plugin "$i"
+    done
+fi
 
 mkdir -p "$MOD_DIR/Config"
-printf "%s\n" "${loaded_plugins[@]}" > "$MOD_DIR/Config/plugins.txt"
+: > "$MOD_DIR/Config/plugins.txt"
+for name in "${PLUGIN_NAMES[@]}"; do
+    if [[ -f "$PLUGINS_DIR/$name/$name.dll" ]]; then
+        printf '%s\n' "$name" >> "$MOD_DIR/Config/plugins.txt"
+    fi
+done
 
 rm -rf "$STAGING_DIR"
 
