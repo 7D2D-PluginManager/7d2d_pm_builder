@@ -361,24 +361,55 @@ build_plugin() {
     local plugin_name="${PLUGIN_NAMES[$index]}"
     local project_path="${PLUGIN_PROJECTS[$index]}"
     local static_path="${PLUGIN_STATICS[$index]}"
-    local plugin_output="$PLUGINS_DIR/$plugin_name"
+    local plugin_tmp="$STAGING_DIR/plugin_$plugin_name"
 
     echo "==> Building plugin: ${PLUGIN_MODULES[$index]}"
-    rm -rf "$plugin_output"
+    rm -rf "$plugin_tmp"
+    mkdir -p "$plugin_tmp" "$MOD_DIR/Config" "$MOD_DIR/Lang"
 
     local properties=("PluginManagerApiPath=$MOD_DIR/" "GameLibsPath=$MANAGED_DIR/")
     if [[ -n "$static_path" ]]; then
         properties+=("StaticPath=$static_path/")
     fi
 
-    msbuild_project "$project_path" "$plugin_output" "${properties[@]}"
+    msbuild_project "$project_path" "$plugin_tmp" "${properties[@]}"
 
-    if [[ -n "$static_path" ]]; then
-        local plugin_root
-        plugin_root="$(dirname "$static_path")"
-        if [[ -d "$plugin_root/lang" && ! -d "$static_path/lang" ]]; then
-            cp -r "$plugin_root/lang" "$plugin_output/"
-        fi
+    cp -f "$plugin_tmp/$plugin_name.dll" "$PLUGINS_DIR/$plugin_name.dll"
+    if [[ -f "$plugin_tmp/$plugin_name.pdb" ]]; then
+        cp -f "$plugin_tmp/$plugin_name.pdb" "$PLUGINS_DIR/$plugin_name.pdb"
+    fi
+
+    find "$plugin_tmp" -maxdepth 1 -type f \( -name '*.dll' -o -name '*.xml' \) | while IFS= read -r dep; do
+        local base stem
+        base="$(basename "$dep")"
+        case "$base" in
+            "$plugin_name.dll"|"$plugin_name.xml") continue ;;
+            System*|PluginManager.*) continue ;;
+        esac
+        stem="${base%.*}"
+        [[ -f "$MANAGED_DIR/$stem.dll" ]] && continue
+        [[ -f "$MOD_DIR/$base" ]] && continue
+        cp -f "$dep" "$MOD_DIR/$base"
+    done
+
+    if [[ -n "$static_path" && -f "$static_path/config.json" ]]; then
+        cp -f "$static_path/config.json" "$MOD_DIR/Config/$plugin_name.json"
+    fi
+
+    local lang_src=""
+    if [[ -n "$static_path" && -d "$static_path/lang" ]]; then
+        lang_src="$static_path/lang"
+    elif [[ -n "$static_path" && -d "$(dirname "$static_path")/lang" ]]; then
+        lang_src="$(dirname "$static_path")/lang"
+    fi
+
+    if [[ -n "$lang_src" ]]; then
+        for f in "$lang_src"/*.json; do
+            [[ -f "$f" ]] || continue
+            local culture
+            culture="$(basename "$f" .json)"
+            cp -f "$f" "$MOD_DIR/Lang/$plugin_name.$culture.json"
+        done
     fi
 }
 
@@ -398,7 +429,7 @@ if [[ "${#SELECTED_INDICES[@]}" -eq 0 ]]; then
     if [[ "$CLEAN" -eq 1 ]]; then
         rm -rf "$OUT_DIR"
     fi
-    mkdir -p "$REFS_DIR" "$MOD_DIR" "$PLUGINS_DIR"
+    mkdir -p "$REFS_DIR" "$MOD_DIR" "$PLUGINS_DIR" "$MOD_DIR/Config" "$MOD_DIR/Lang" "$MOD_DIR/Data"
 
     build_core
 
@@ -406,7 +437,7 @@ if [[ "${#SELECTED_INDICES[@]}" -eq 0 ]]; then
         build_plugin "$i"
     done
 else
-    mkdir -p "$REFS_DIR" "$MOD_DIR" "$PLUGINS_DIR"
+    mkdir -p "$REFS_DIR" "$MOD_DIR" "$PLUGINS_DIR" "$MOD_DIR/Config" "$MOD_DIR/Lang" "$MOD_DIR/Data"
 
     if [[ "$FORCE_CORE" -eq 1 || ! -f "$MOD_DIR/PluginManager.Core.dll" ]]; then
         build_core
@@ -417,13 +448,7 @@ else
     done
 fi
 
-mkdir -p "$MOD_DIR/Config"
-: > "$MOD_DIR/Config/plugins.txt"
-for name in "${PLUGIN_NAMES[@]}"; do
-    if [[ -f "$PLUGINS_DIR/$name/$name.dll" ]]; then
-        printf '%s\n' "$name" >> "$MOD_DIR/Config/plugins.txt"
-    fi
-done
+mkdir -p "$PLUGINS_DIR/disabled"
 
 rm -rf "$STAGING_DIR"
 
